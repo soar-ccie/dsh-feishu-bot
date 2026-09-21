@@ -1,0 +1,10 @@
+# 直接依赖（版本是实际验证过能跑的组合）
+#
+#   pip install -r requirements.txt
+#
+# lark-oapi 是飞书官方 Python SDK，负责长连接收事件；
+# requests 用于主动调飞书 REST API；
+# pycryptodome 供 SDK 解密事件回调（长连接模式下其实用不到，但装上更稳妥）。
+lark-oapi==1.7.3
+requests==2.34.2
+pycryptodome==3.23.0

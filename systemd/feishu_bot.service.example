@@ -1,0 +1,47 @@
+[Unit]
+Description=飞书 DeepSeek Bot (AI-Agent) — DSH 转发
+After=network-online.target
+Wants=network-online.target
+# dsh-web 是 Bot 的下游依赖;但 Bot 自带「启动DSH」自救,所以这里不强制 Requires
+After=dsh-web.service
+
+[Service]
+Type=simple
+User=<你的用户名>
+Group=<你的用户名>
+WorkingDirectory=/home/<你的用户名>/software/feishu-bot
+
+Environment="HOME=/home/<你的用户名>"
+Environment="USER=<你的用户名>"
+# DSH 数据目录(凭据/会话/profile)。不设的话 dsh CLI 会去找不存在的 ~/.dsh
+Environment="DSH_HOME=/home/<你的用户名>/software/deepseek_harness_agent/user_data"
+
+Environment="FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx"
+Environment="FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+Environment="FEISHU_ENCRYPT_KEY=xxxxxxxxxxxxxxxx"
+Environment="FEISHU_VERIFICATION_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# 注意:不设置 DEEPSEEK_API_KEY。
+# 飞书 Bot 通过 dsh --profile headless 处理任务,复用 DSH 受管凭据
+# (user_data/.credentials.yaml)里的 key —— 专项专用,不另配独立 AI key。
+
+# 不生成 __pycache__(保持目录干净;直接跑主脚本本来也不会生成,这里是双保险)
+Environment="PYTHONDONTWRITEBYTECODE=1"
+
+# 前台启动 Bot(Bot 是 systemd 跟踪的主进程);任务转发给 DSH headless
+# Python 用 Bot 目录内的 venv,依赖不依赖/不污染 miniconda
+ExecStart=/home/<你的用户名>/software/feishu-bot/venv/bin/python3 /home/<你的用户名>/software/feishu-bot/feishu_bot.py
+
+ExecStop=/bin/bash -c 'pkill -f feishu_bot.py 2>/dev/null'
+
+Restart=always
+RestartSec=10
+
+# 日志:程序自己写 ~/software/feishu-bot/logs/feishu_bot.log
+# (由程序内的 RotatingFileHandler 管理,单个文件超过 50MB 自动轮转)
+# 这里【故意不做】StandardOutput/StandardError 重定向到文件:
+#   1) 会和程序自己的日志重复写、且 systemd 的 append 不支持按大小轮转
+#   2) 程序的 stdout 默认进 journal,排查"启动期就崩"更方便:
+#      journalctl -u feishu_bot -n 50
+
+[Install]
+WantedBy=multi-user.target

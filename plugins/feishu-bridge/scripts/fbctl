@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+"""fbctl — 飞书 Bot 的项目管理工具（供 DSH agent 通过 bash 调用）
+
+职责：管理「飞书侧」的项目数据，并把 DSH 的项目会话串起来。
+数据全部在 Bot 自己的目录里（session/），**只读** DSH 的会话文件，绝不写。
+
+设计原则（为了将来开源）：
+  - 零硬编码路径：一切从脚本位置 + 环境变量推导
+  - 数据目录可用 FB_DATA_DIR 覆盖（方案 B）
+  - 读 DSH 私有格式的地方全部集中在本文件，坏了只改这里
+
+命令：
+  list                列出项目（同步过的）
+  current             显示当前项目
+  switch <名字|序号>   切换当前项目
+  show [项目]         显示项目摘要
+  log <内容>          给当前项目记一条（用户说的话/进展）
+  gui [项目] [条数]    读该项目在 GUI 里的最近对话原文
+  summary <文本>      更新当前项目的摘要
+  sync                从 DSH 同步项目列表
+  new <名字>          新建一个不绑定 GUI 的项目
+  stats               存储统计
+  maintain            滚动分片 + 冷归档
+  gui-hide            把 Bot 自己产生的 GUI 会话从侧栏隐藏（归档，不删文件）
+  gui-restore         取消隐藏
+  gui-status          看看侧栏上还有什么、藏了什么
+"""
+
+import os
+import sys
+import re
+import json
+import glob
+import time
+import shutil
+import subprocess
+import argparse
+import urllib.request
+from datetime import datetime
+
+# ============================================================
+# 路径（零硬编码；环境变量优先）
+# ============================================================
+
+def _find_bot_dir():
+    """从本脚本位置向上找 feishu_bot.py，定位 Bot 根目录"""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        if os.path.isfile(os.path.join(d, "feishu_bot.py")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    # 兜底：scripts/.. 的上一级
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+BOT_DIR = os.environ.get("FB_BOT_DIR") or _find_bot_dir()
+# 方案 A：数据放安装目录内（默认）；方案 B：FB_DATA_DIR 指到别处
+DATA_DIR = os.environ.get("FB_DATA_DIR") or BOT_DIR
+SESSION_DIR = os.path.join(DATA_DIR, "session")
+
+INDEX_FILE = os.path.join(SESSION_DIR, "_index.json")
+DEFAULT_CHAT = os.path.join(SESSION_DIR, "default.jsonl")
+
+# ---- DSH 侧（只读）----
+def _find_dsh_home():
+    for cand in (
+        os.environ.get("DSH_HOME"),
+        os.path.expanduser("~/software/deepseek_harness_agent/user_data"),
+        os.path.expanduser("~/.dsh"),
+    ):
+        if cand and os.path.isdir(cand):
+            return cand
+    return os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+
+
+DSH_HOME = _find_dsh_home()
+DSH_SESSIONS = os.path.join(DSH_HOME, "sessions")
+DSH_WORKSPACE = os.path.join(DSH_HOME, "storages", "workspace.json")
+
+# ---- 阈值 ----
+CHAT_MAX_BYTES = 5 * 1024 * 1024     # 单个热文件上限 5MB
+CHAT_MAX_LINES = 2000                # 或 2000 条
+ARCHIVE_MONTHS = 3                   # 文件名日期超过 3 个月 → 转冷
+MAX_MSG_CHARS = 2000                 # 单条消息存储上限
+INJECT_LINES = 30                    # 推荐注入提示词的条数（写进手册给 agent 看）
+
+
+# ============================================================
+# 基础工具
+# ============================================================
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def die(msg, code=1):
+    print(f"❌ {msg}")
+    sys.exit(code)
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def safe_name(s):
+    """把项目标题洗成安全的文件夹名片段"""
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(s or "")).strip(" .")
+    s = re.sub(r"\s+", " ", s)
+    return s[:40] or "未命名"
+
+
+def truncate(s, n=MAX_MSG_CHARS):
+    s = str(s or "")
+    return s if len(s) <= n else s[:n] + f"…(截断,原 {len(s)} 字符)"
+
+
+# ============================================================
+# 索引（_index.json）—— "查看会话" 的数据源
+# ============================================================
+
+# 第 1 项永远是它：飞书自己的默认会话（不对应任何 GUI 项目）
+DEFAULT_ENTRY = {"session_id": "", "title": "默认", "folder": "", "_default": True}
+
+
+def load_index():
+    d = load_json(INDEX_FILE, None)
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("projects", [])
+    d.setdefault("current", "")
+    d.setdefault("synced_at", "")
+    return d
+
+
+def save_index(d):
+    d["synced_at"] = now_str()
+    save_json(INDEX_FILE, d)
+
+
+def dsh_archived_ids():
+    """DSH 侧【已归档】的会话 ID 集合。
+
+    DSH 的归档语义（源码核对过）：只往 storages/workspace.json 的
+    `global.archivedSessionIds` 记一笔，文件不动、workspace 成员关系不动，
+    但 GUI 里【所有视图都不显示】（分组/单列表/搜索全都过滤掉）。
+
+    飞书侧要保持一致的观感，所以项目列表也把这些会话剔掉。
+    ⚠️ 只影响展示：_index.json 里的记录和 session/ 下的数据都不动，
+    在 GUI 取消归档（或 fbctl gui-restore）就自动恢复显示。
+    """
+    ws = load_json(DSH_WORKSPACE, {}) or {}
+    try:
+        return set((ws.get("global", {}) or {}).get("archivedSessionIds") or [])
+    except Exception:
+        return set()
+
+
+def project_hidden(p):
+    """该项目绑定的 DSH 会话是不是已归档（= 飞书侧也隐藏）"""
+    return bool(p) and (p.get("session_id") or "") in dsh_archived_ids()
+
+
+def visible_projects(idx, include_hidden=False):
+    """飞书侧展示用的项目列表（保持 _index.json 原始顺序）。
+
+    默认剔除已归档的；`include_hidden=True` 时原样返回（给 `list --all` 用）。
+    ⚠️ cmd_list 和 find_project 必须用同一个顺序，否则序号会对不上。
+    """
+    ps = idx.get("projects", [])
+    if include_hidden:
+        return list(ps)
+    return [p for p in ps if not project_hidden(p)]
+
+
+def _match_project(ps, key):
+    """在给定列表里按 序号/文件夹/标题/sessionId 找（序号 1 = 默认）"""
+    if not key:
+        return None
+    k = str(key).strip()
+    if k in ("默认", "default", "1"):
+        return dict(DEFAULT_ENTRY)
+    # ⚠️ 不能用 k.isdigit() 判断序号：'²'、'①②③' 这类字符 isdigit() 都是 True，
+    #    但 int() 会抛 ValueError —— 实测 `fbctl switch ²` 直接打了一串调用栈。
+    #    这里改成"能安全转成整数才当序号"，转不了就走下面的名字匹配。
+    try:
+        i = int(k)
+    except ValueError:
+        i = None
+    if i is not None:
+        if 2 <= i <= len(ps) + 1:
+            return ps[i - 2]
+        return None
+    for p in ps:
+        if k in (p.get("folder"), p.get("title"), p.get("session_id")):
+            return p
+    # 模糊匹配标题
+    for p in ps:
+        if k and k in (p.get("title") or ""):
+            return p
+    return None
+
+
+def find_project(idx, key):
+    """按 序号 / 文件夹名 / 标题 / sessionId 找项目
+
+    序号约定(用户要求):
+      1            → 「默认」(飞书自己的会话,非 GUI)
+      2 .. N+1     → GUI 项目,按 GUI 的顺序
+
+    ⚠️ 只认【可见】项目 —— 已归档的会话在飞书侧同样"不存在"，
+    序号也就跟着重排。要恢复先取消归档。
+    """
+    return _match_project(visible_projects(idx), key)
+
+
+def find_project_any(idx, key):
+    """和 find_project 一样，但**包含已归档项目**。
+
+    给 context / gui / show 这类"要先拿到 session_id 才能判断有没有归档"的
+    场景用 —— 否则找不到项目就退化成拿原始参数当 folder，判断会失效。
+    """
+    return _match_project(idx.get("projects", []), key)
+
+
+# ============================================================
+# DSH 侧读取（只读；格式变化时只需要改这一段）
+# ============================================================
+
+def dsh_project_list():
+    """从 DSH 的 workspace.json 读出项目（会话）列表。
+
+    返回 [(session_id, workdir), ...]；读不到就返回 None（调用方降级）。
+    """
+    ws = load_json(DSH_WORKSPACE, None)
+    if not isinstance(ws, dict):
+        return None
+    out = []
+    try:
+        for w in ws.get("tables", {}).get("workspaces", {}).values():
+            for sid in w.get("sessionIds", []) or []:
+                out.append((sid, w.get("path") or ""))
+    except Exception:
+        return None
+    return out
+
+
+def _session_dir(session_id):
+    """定位会话目录（workspace 目录名由 cwd 编码而来，这里直接扫）"""
+    for d in glob.glob(os.path.join(DSH_SESSIONS, "*", session_id)):
+        if os.path.isdir(d):
+            return d
+    return ""
+
+
+def _session_file(session_dir):
+    """取版本号最高的 session*.jsonl.zstd（将来出 v4 也能自动用上）"""
+    best, best_v = "", -1
+    if not session_dir:
+        return ""
+    for f in glob.glob(os.path.join(session_dir, "session*.jsonl.zstd")):
+        m = re.search(r"session(?:\.v(\d+))?\.jsonl\.zstd$", os.path.basename(f))
+        if not m:
+            continue
+        v = int(m.group(1)) if m.group(1) else 0
+        if v > best_v:
+            best, best_v = f, v
+    return best
+
+
+def _zstd_lines(path, limit_bytes=8 * 1024 * 1024):
+    """把 zstd 压缩的 JSONL 解出来（只取尾部，避免大文件全量读）"""
+    try:
+        # 先看原始大小，决定是整体解还是只解尾部
+        size = os.path.getsize(path)
+        if size <= limit_bytes:
+            out = subprocess.run(["zstdcat", path], capture_output=True, timeout=60)
+            return out.stdout.decode("utf-8", "ignore").splitlines()
+        # 大文件：只解尾部（zstd 不支持 seek，退化为整体解但限时）
+        out = subprocess.run(["zstdcat", path], capture_output=True, timeout=120)
+        return out.stdout.decode("utf-8", "ignore").splitlines()
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
+def read_gui_messages(session_id, limit=30):
+    """读 GUI 会话的最近 limit 条「人机对话」，返回 [{"role","text","ts"}, ...]
+
+    宽松解析：只认关键字段，不依赖 schema 版本。
+    一轮里助手会产生多条消息（思考/中间步骤/最终回答），这里**收敛为最后一条**，
+    否则喂给模型的上下文会塞满半成品。
+    """
+    sd = _session_dir(session_id)
+    f = _session_file(sd)
+    if not f:
+        return []
+    msgs = []
+    for line in _zstd_lines(f):
+        line = line.strip()
+        # 只处理这两种事件；注意 "user/message" 里 message 前面是 "/"，
+        # 不能用 '"message"' 做子串判断（那会把用户消息整批漏掉）
+        if not line or ('"user/message"' not in line and '"assistant/message"' not in line):
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        d = o.get("data") or {}
+        ts = o.get("time") or 0
+        if t == "user/message":
+            src = (d.get("source") or {}).get("kind")
+            if src not in ("user", "webhook"):     # 跳过系统/插件注入
+                continue
+            txt = "".join(c.get("text", "") for c in (d.get("content") or [])
+                          if isinstance(c, dict) and c.get("type") == "text")
+            if txt.strip():
+                msgs.append({"role": "user", "text": txt, "ts": ts})
+        elif t == "assistant/message":
+            m = d.get("message") or {}
+            txt = "".join(c.get("text", "") for c in (m.get("content") or [])
+                          if isinstance(c, dict) and c.get("type") == "text")
+            if not txt.strip():
+                continue
+            # 连续助手消息 → 只留最后一条（本轮的最终回答）
+            if msgs and msgs[-1]["role"] == "assistant":
+                msgs[-1] = {"role": "assistant", "text": txt, "ts": ts}
+            else:
+                msgs.append({"role": "assistant", "text": txt, "ts": ts})
+    return msgs[-limit:]
+
+
+def session_probe(session_id):
+    """返回 (最新标题, 是否有用户消息)
+
+    用来识别"空壳会话":DSH 重启或浏览器重连时会自动建一个空会话 ——
+    只有初始化事件、没有标题也没有对话，这种不该进项目列表。
+    """
+    sd = _session_dir(session_id)
+    f = _session_file(sd)
+    if not f:
+        return "", False
+    title, has_msg = "", False
+    for line in _zstd_lines(f):
+        if '"session/title"' in line:
+            try:
+                t = (json.loads(line).get("data") or {}).get("title")
+                if t:
+                    title = t
+            except Exception:
+                pass
+        elif '"user/message"' in line:
+            has_msg = True
+    return title, has_msg
+
+
+def session_title(session_id):
+    """从会话文件里取最新的标题"""
+    t, _ = session_probe(session_id)
+    return t
+
+
+# ============================================================
+# 项目文件夹 / 对话文件
+# ============================================================
+
+def project_dir(folder):
+    return os.path.join(SESSION_DIR, folder)
+
+
+def guisession_path(folder):
+    return os.path.join(project_dir(folder), "guisession.json")
+
+
+def load_guisession(folder):
+    return load_json(guisession_path(folder), {})
+
+
+def save_guisession(folder, d):
+    save_json(guisession_path(folder), d)
+
+
+def _chat_paths(folder):
+    """热文件（按文件名排序，序号在前的先写）"""
+    return sorted(glob.glob(os.path.join(project_dir(folder), "chat_*.jsonl")))
+
+
+def current_chat(folder):
+    """当前热文件；没有就按今天日期建一个"""
+    files = _chat_paths(folder)
+    if files:
+        return files[-1]
+    os.makedirs(project_dir(folder), exist_ok=True)
+    return os.path.join(project_dir(folder), f"chat_{time.strftime('%Y%m%d')}-01.jsonl")
+
+
+def _needs_roll(path):
+    try:
+        if os.path.getsize(path) >= CHAT_MAX_BYTES:
+            return True
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for _ in f) >= CHAT_MAX_LINES
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _next_chat(folder):
+    """滚一个新热文件：chat_<今天>-<序号+1>.jsonl"""
+    today = time.strftime("%Y%m%d")
+    n = 1
+    for p in _chat_paths(folder):
+        m = re.search(r"chat_(\d{8})-(\d+)\.jsonl$", os.path.basename(p))
+        if m and m.group(1) == today:
+            n = max(n, int(m.group(2)) + 1)
+    return os.path.join(project_dir(folder), f"chat_{today}-{n:02d}.jsonl")
+
+
+def append_chat(folder, role, text):
+    """追加一条对话（自动滚动）"""
+    path = current_chat(folder)
+    if _needs_roll(path):
+        path = _next_chat(folder)
+    os.makedirs(project_dir(folder), exist_ok=True)
+    rec = {"role": role, "text": truncate(text), "ts": int(time.time() * 1000)}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return path
+
+
+def read_chat(folder, limit=INJECT_LINES):
+    """读该项目最近的 limit 条（只读热文件）"""
+    out = []
+    for p in _chat_paths(folder):
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return out[-limit:]
+
+
+def maintain(folder):
+    """滚动 + 冷归档；返回 (滚动数, 归档数)"""
+    rolled = archived = 0
+    files = _chat_paths(folder)
+    # 归档：非当前文件 && 文件名日期超过 ARCHIVE_MONTHS
+    cutoff = time.time() - ARCHIVE_MONTHS * 30 * 86400
+    for p in files[:-1] if len(files) > 1 else []:
+        m = re.search(r"chat_(\d{8})-\d+\.jsonl$", os.path.basename(p))
+        if not m:
+            continue
+        try:
+            d = datetime.strptime(m.group(1), "%Y%m%d")
+        except Exception:
+            continue
+        if d.timestamp() < cutoff:
+            year = m.group(1)[:4]
+            dest_dir = os.path.join(project_dir(folder), "archive", year)
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.move(p, os.path.join(dest_dir, os.path.basename(p)))
+            archived += 1
+    return rolled, archived
+
+
+# ============================================================
+# 命令实现
+# ============================================================
+
+def cmd_list(args):
+    idx = load_index()
+    show_all = bool(getattr(args, "all", False))
+    ps = visible_projects(idx, include_hidden=show_all)
+    total = len(idx.get("projects", []))
+    hidden = total - len(visible_projects(idx))
+    cur = idx.get("current", "")
+    taily = ""
+    if hidden and show_all:
+        taily = f"，其中 {hidden} 个已归档(标了 🗄)"
+    # 用户要求精简:不显示同步时间、不显示 folder/session、不显示"另有 N 个已归档"
+    # (已归档的信息由底部的 🗄 段落统一说明,见 cmd_archived_list --preview)
+    print(f"📋 会话列表（共 {len(ps) + 1} 个{taily}）")
+    # 第 1 个永远是「默认」(飞书自己的会话，不对应 GUI 项目)
+    mark = "【当前】" if not cur else ""
+    print(f"1. {DEFAULT_ENTRY['title']}（飞书默认会话） {mark}".rstrip())
+    # 之后按 GUI 的顺序
+    for i, p in enumerate(ps, 2):
+        mark = "【当前】" if p.get("folder") == cur else ""
+        tag = " 🗄" if project_hidden(p) else ""
+        print(f"{i}. {p.get('title') or '(无标题)'}{tag} {mark}".rstrip())
+        if show_all:
+            # --all 是排查视图,folder/session 只在这里给
+            print(f"     folder={p.get('folder')}  session={(p.get('session_id') or '')[:20]}")
+
+
+def cmd_current(args):
+    idx = load_index()
+    cur = idx.get("current", "")
+    if not cur:
+        print(f"当前项目: {DEFAULT_ENTRY['title']}（飞书默认会话，未绑定 GUI 项目）")
+        return
+    # 这里按 folder 直查，不走 find_project（那个已经剔掉归档项目了）
+    p = next((x for x in idx.get("projects", []) if x.get("folder") == cur), None)
+    print(f"当前项目: {p.get('title') if p else cur}")
+    print(f"folder: {cur}")
+    if p:
+        print(f"session_id: {p.get('session_id')}")
+    if project_hidden(p):
+        print("⚠️ 该项目绑定的 DSH 会话已归档 → GUI 和飞书两侧都不显示它了")
+        print(f"   要恢复：在 GUI 里取消归档，或 `fbctl gui-restore {p.get('session_id')}`")
+
+
+def cmd_switch(args):
+    idx = load_index()
+    p = find_project(idx, args.key)
+    if not p:
+        k = str(args.key).strip()
+        hid = [x for x in idx.get("projects", [])
+               if project_hidden(x) and k in (x.get("folder"), x.get("title"), x.get("session_id"))]
+        if hid:
+            die(f"项目「{hid[0].get('title')}」绑定的 DSH 会话已归档，飞书侧按同样的规则不显示。\n"
+                f"   要恢复：在 GUI 里取消归档，或 `fbctl gui-restore {hid[0].get('session_id')}`")
+        die(f"找不到项目: {args.key}（先运行 fbctl list 看看有哪些）")
+    if p.get("_default"):
+        idx["current"] = ""
+        save_index(idx)
+        print("✅ 已切换到: 默认（飞书默认会话）")
+        return
+    idx["current"] = p.get("folder")
+    save_index(idx)
+    print(f"✅ 已切换到项目: {p.get('title')}  (folder={p.get('folder')})")
+
+
+def cmd_show(args):
+    idx = load_index()
+    folder = args.project or idx.get("current")
+    if not folder:
+        print("（没有指定项目，也没有当前项目）")
+        return
+    p = find_project(idx, folder)
+    if not p:
+        # 可能是已归档的项目：show 是显式查询，允许看，但要标注
+        k = str(folder).strip()
+        p = next((x for x in idx.get("projects", [])
+                  if k in (x.get("folder"), x.get("title"), x.get("session_id"))), None)
+    folder = p.get("folder") if p else folder
+    g = load_guisession(folder)
+    print(f"📁 项目: {g.get('title') or (p or {}).get('title') or folder}")
+    if project_hidden(p):
+        print("🗄 状态   : 已归档（DSH 侧 GUI 不显示，飞书侧也不显示）")
+        print(f"           恢复：`fbctl gui-restore {p.get('session_id')}`")
+    print(f"session_id : {g.get('session_id') or (p or {}).get('session_id') or '(未绑定)'}")
+    print(f"摘要更新于 : {g.get('summary_at') or '从未'}")
+    print(f"最近活动   : {g.get('last_active') or '未知'}")
+    s = (g.get("summary") or "").strip()
+    print("── 摘要 ──")
+    print(s if s else "（还没有摘要。可以用 `fbctl gui` 读会话内容后，用 `fbctl summary` 写回）")
+    hot = _chat_paths(folder)
+    n = sum(1 for p_ in hot for _ in open(p_, encoding="utf-8", errors="ignore")) if hot else 0
+    print(f"── 飞书侧记录 ──\n热文件 {len(hot)} 个，共约 {n} 条")
+
+
+def _default_append(role, text):
+    """未绑定项目时，对话落到 default.jsonl"""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    rec = {"role": role, "text": truncate(text), "ts": int(time.time() * 1000)}
+    with open(DEFAULT_CHAT, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _default_read(limit):
+    out = []
+    try:
+        with open(DEFAULT_CHAT, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except FileNotFoundError:
+        pass
+    return out[-limit:]
+
+
+def _record(role, text):
+    """统一记录入口：有当前项目就进项目，否则进 default"""
+    idx = load_index()
+    folder = idx.get("current")
+    if folder and find_project(idx, folder):
+        append_chat(folder, role, text)
+        g = load_guisession(folder)
+        g["last_active"] = now_str()
+        save_guisession(folder, g)
+        return folder
+    _default_append(role, text)
+    return "(default)"
+
+
+def cmd_log(args):
+    where = _record("user", args.text)
+    print(f"✅ 已记录（{where}）")
+
+
+def cmd_reply(args):
+    where = _record("assistant", args.text)
+    print(f"✅ 已记录（{where}）")
+
+
+def cmd_context(args):
+    """组装可直接拼进提示词的上下文。
+
+    结构：项目信息 + GUI 侧最近对话 + 飞书侧最近对话。
+    每条截断到 300 字符（控制 token）。
+    """
+    idx = load_index()
+    folder = args.project or idx.get("current") or ""
+    p = find_project_any(idx, folder) if folder else None
+    if p:
+        folder = p.get("folder")
+    g = load_guisession(folder) if folder else {}
+    title = g.get("title") or (p or {}).get("title") or ""
+    sid = g.get("session_id") or (p or {}).get("session_id") or ""
+    hidden = project_hidden(p) or bool(sid and sid in dsh_archived_ids())
+
+    out = []
+    if folder:
+        out.append(f"【当前项目】{title}（folder={folder}）")
+        s = (g.get("summary") or "").strip()
+        if s:
+            out.append(f"【项目摘要】{s}")
+    else:
+        out.append("【当前项目】无（用户还没选择项目）")
+    if hidden:
+        out.append("【注意】该项目绑定的 DSH 会话已被归档（GUI 里不显示），"
+                   "所以下面不再注入 GUI 侧内容；飞书侧记录照旧。")
+
+    # GUI 侧（只读）—— 已归档的会话在 GUI 里不显示，这里也不注入
+    if sid and not hidden:
+        gm = read_gui_messages(sid, args.gui)
+        if gm:
+            out.append("")
+            out.append(f"【该项目在 Web GUI 里的最近 {len(gm)} 条对话（只读镜像）】")
+            for m in gm:
+                who = "用户" if m["role"] == "user" else "助手"
+                out.append(f"{who}: {m['text'][:300]}")
+
+    # 飞书侧
+    fm = read_chat(folder, args.feishu) if folder else _default_read(args.feishu)
+    if fm:
+        out.append("")
+        out.append(f"【你在飞书侧和用户关于该项目的最近 {len(fm)} 条对话】")
+        for m in fm:
+            who = "用户" if m["role"] == "user" else "助手"
+            out.append(f"{who}: {m['text'][:300]}")
+
+    print("\n".join(out))
+
+
+def cmd_gui(args):
+    idx = load_index()
+    folder = args.project or idx.get("current")
+    if not folder:
+        die("没有指定项目，也没有当前项目")
+    p = find_project_any(idx, folder)
+    folder = p.get("folder") if p else folder
+    g = load_guisession(folder)
+    sid = (p or {}).get("session_id") or g.get("session_id")
+    if not sid:
+        die(f"项目 [{folder}] 没有绑定 DSH 会话（session_id 缺失）")
+    # 已归档 = GUI 里不显示 → 飞书侧也当作看不到
+    if sid in dsh_archived_ids():
+        die(f"项目 [{p.get('title') if p else folder}] 绑定的会话 {sid} 已被归档，"
+            f"GUI 和飞书两侧都不显示。\n"
+            f"   要恢复：在 GUI 里取消归档，或 `fbctl gui-restore {sid}`")
+    msgs = read_gui_messages(sid, args.limit)
+    if not msgs:
+        print(f"（读不到会话内容。session_id={sid}）")
+        print(f"  提示：DSH_HOME={DSH_HOME}")
+        return
+    print(f"📖 [{folder}] 在 GUI 里的最近 {len(msgs)} 条对话：\n")
+    for m in msgs:
+        t = datetime.fromtimestamp(m["ts"] / 1000).strftime("%m-%d %H:%M") if m.get("ts") else "--"
+        who = "用户" if m["role"] == "user" else "助手"
+        print(f"[{t}] {who}: {m['text'][:500]}")
+        print()
+
+
+def cmd_summary(args):
+    idx = load_index()
+    folder = idx.get("current")
+    if not folder:
+        die("当前没有进入任何项目")
+    g = load_guisession(folder)
+    g["summary"] = args.text
+    g["summary_at"] = now_str()
+    save_guisession(folder, g)
+    print(f"✅ 摘要已更新（项目 {folder}）")
+
+
+def cmd_sync(args):
+    """从 DSH 同步项目列表到 _index.json"""
+    idx = load_index()
+    by_sid = {p.get("session_id"): p for p in idx.get("projects", [])}
+    plist = dsh_project_list()
+    if plist is None:
+        print("⚠️ 读不到 DSH 的 workspace.json，保留现有索引（降级）")
+        print(f"   路径: {DSH_WORKSPACE}")
+        return
+    added = skipped = skipped_arch = 0
+    arch = dsh_archived_ids()
+    for sid, _wd in plist:
+        if sid in by_sid:
+            continue
+        # 已归档的会话在 GUI 里不显示 → 飞书侧也不该为它建项目
+        if sid in arch:
+            skipped_arch += 1
+            continue
+        title, has_msg = session_probe(sid)
+        # 空壳会话跳过：DSH 重启/浏览器重连会自动建一个没有任何内容和标题的会话，
+        # 不该出现在飞书的项目列表里（否则每次重启都多一个"未命名"）。
+        if not title and not has_msg:
+            skipped += 1
+            continue
+        title = title or f"会话{sid[-6:]}"
+        folder = f"{safe_name(title)}_{sid.replace('session-', '')[:6]}"
+        rec = {"session_id": sid, "title": title, "folder": folder,
+               "last_active": now_str()}
+        idx["projects"].append(rec)
+        by_sid[sid] = rec
+        os.makedirs(project_dir(folder), exist_ok=True)
+        g = load_guisession(folder)
+        g.update({"session_id": sid, "title": title})
+        g.setdefault("created", now_str())
+        save_guisession(folder, g)
+        added += 1
+    # 更新已有项目的标题（DSH 会自动改标题）—— 已归档的不动
+    for sid, p in by_sid.items():
+        if not p.get("folder") or sid in arch:
+            continue
+        t = session_title(sid)
+        if t and t != p.get("title"):
+            p["title"] = t
+            g = load_guisession(p["folder"])
+            g["title"] = t
+            save_guisession(p["folder"], g)
+    save_index(idx)
+    tail = f"，跳过 {skipped} 个空会话" if skipped else ""
+    if skipped_arch:
+        tail += f"，跳过 {skipped_arch} 个已归档会话"
+    print(f"✅ 同步完成：新增 {added} 个项目，共 {len(idx['projects'])} 个{tail}")
+
+
+def cmd_remove(args):
+    """从索引里移除一个项目。
+
+    默认【只从列表移除，不删磁盘数据】(安全);加 --purge 才连同记录一起删除。
+    """
+    idx = load_index()
+    p = find_project(idx, args.key)
+    if not p:
+        die(f"找不到项目: {args.key}")
+    if p.get("_default"):
+        die("「默认」是内置会话，不能移除")
+    folder = p.get("folder")
+    idx["projects"] = [x for x in idx.get("projects", []) if x.get("folder") != folder]
+    if idx.get("current") == folder:
+        idx["current"] = ""
+    save_index(idx)
+    print(f"✅ 已从列表移除: {p.get('title')} (folder={folder})")
+    if args.purge:
+        d = project_dir(folder)
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+            print(f"🗑  --purge:已删除记录目录 {folder}/")
+    else:
+        print(f"ℹ️  磁盘记录仍保留在 session/{folder}/（要一并删除请加 --purge）")
+
+
+def cmd_new(args):
+    """新建项目。带 --session 时直接绑定一个已有的 GUI 会话。"""
+    idx = load_index()
+    name = args.name.strip()
+    sid = (getattr(args, "session", "") or "").strip()
+    folder = f"{safe_name(name)}_{int(time.time()) % 100000:05d}"
+    os.makedirs(project_dir(folder), exist_ok=True)
+    rec = {"session_id": sid, "title": name, "folder": folder, "last_active": now_str()}
+    idx["projects"].append(rec)
+    idx["current"] = folder
+    save_index(idx)
+    save_guisession(folder, {"session_id": sid, "title": name, "created": now_str()})
+    if sid:
+        print(f"✅ 已新建项目「{name}」并绑定会话 {sid}")
+    else:
+        print(f"✅ 已新建项目: {name} (folder={folder})，并设为当前项目")
+
+
+def cmd_bind(args):
+    """把一个已有的 GUI 会话绑定成项目(手动兜底方案)
+
+    - 给定 sessionId 时直接绑
+    - 只给标题时，在该标题对应的会话里找(见 dsh 会话目录)
+    """
+    idx = load_index()
+    sid = args.session_id.strip()
+    title = (args.title or "").strip()
+
+    # 已绑过就直接切换过去
+    for p in idx.get("projects", []):
+        if p.get("session_id") == sid:
+            idx["current"] = p.get("folder")
+            save_index(idx)
+            print(f"ℹ️ 该会话已绑定为项目「{p.get('title')}」，已切换过去")
+            return
+
+    if not title:
+        title = session_title(sid) or f"会话{sid[:12]}"
+    folder = f"{safe_name(title)}_{int(time.time()) % 100000:05d}"
+    os.makedirs(project_dir(folder), exist_ok=True)
+    rec = {"session_id": sid, "title": title, "folder": folder, "last_active": now_str()}
+    idx["projects"].append(rec)
+    idx["current"] = folder
+    save_index(idx)
+    save_guisession(folder, {"session_id": sid, "title": title, "created": now_str()})
+    print(f"✅ 已绑定会话 {sid} → 项目「{title}」(folder={folder})")
+
+
+def cmd_stats(args):
+    print(f"Bot 目录  : {BOT_DIR}")
+    print(f"数据目录  : {DATA_DIR}" + ("  （方案B: FB_DATA_DIR）" if DATA_DIR != BOT_DIR else "  （方案A: 安装目录内）"))
+    print(f"DSH_HOME : {DSH_HOME}")
+    idx = load_index()
+    print(f"项目数    : {len(idx.get('projects', []))}   当前: {idx.get('current') or '(无)'}")
+    total = 0
+    for p in idx.get("projects", []):
+        hot = _chat_paths(p.get("folder", ""))
+        cold = glob.glob(os.path.join(project_dir(p.get("folder", "")), "archive", "*", "*.jsonl"))
+        sz = sum(os.path.getsize(x) for x in hot + cold) if hot or cold else 0
+        total += sz
+        print(f"  {p.get('folder'):<32} 热{len(hot)} 冷{len(cold)}  {sz/1024:.1f} KB")
+    dsz = os.path.getsize(DEFAULT_CHAT) if os.path.exists(DEFAULT_CHAT) else 0
+    print(f"  {'default.jsonl':<32}            {dsz/1024:.1f} KB")
+    print(f"合计      : {(total+dsz)/1024:.1f} KB")
+
+
+def cmd_maintain(args):
+    idx = load_index()
+    r = a = 0
+    for p in idx.get("projects", []):
+        x, y = maintain(p.get("folder", ""))
+        r += x
+        a += y
+    print(f"✅ 维护完成：滚动 {r} 个，归档 {a} 个")
+
+
+# ============================================================
+# GUI 侧栏「未分组」治理
+# ============================================================
+#
+# 问题：飞书每来一条消息，Bot 都会跑一次 `dsh --profile headless`。
+#       headless 会话不属于任何 workspace，于是全部堆进 GUI 侧栏那个
+#       没有名字的「未分组」组里。
+#
+# 为什么"归档"能让整组消失：
+#   客户端 dsh-client-ui-workspace 的 groupByWorkspace() 只在
+#   `stray.length > 0` 时才 push 那个无标题分组。把散客全部归档后，
+#   stray 为空 → 「未分组」这一组**根本不出现**（不是变成空组）。
+#
+# ⚠️ 归档 ≠ 删除：
+#   只是往 storages/workspace.json 的 archivedSessionIds 里记一笔，
+#   会话文件（session.v3.jsonl.zstd）原封不动留在磁盘上。
+#   用户要求会话【永久保留】，所以这里永远只归档、绝不删除。
+#
+# 只归档"确实是 Bot 产生的"会话：用提示词首行做指纹，且已登记进
+# workspace 的会话（GUI 里真正的项目）一律不碰。
+
+BOT_PROMPT_MARKER = "【飞书 Bot 发起】"
+# 历史会话里没有上面这行标记（那时还没加），用这两个开头语兜底识别
+BOT_PROMPT_LEGACY = ("你是通过飞书和用户对话的助手", "用户通过飞书发来一张图片")
+GUI_STATE_FILE = os.path.join(SESSION_DIR, "_gui_hygiene.json")
+
+
+def _dsh_web_port():
+    """从 web profile 的 patch 里读端口（和 Bot 的做法一致）"""
+    cfg = os.path.join(DSH_HOME, "profiles", "web", "cordis.patch.yml")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("port:"):
+                    nums = re.findall(r"\d+", s)
+                    if nums:
+                        return int(nums[-1])
+    except Exception:
+        pass
+    return 8080
+
+
+def gui_plugin(payload, timeout=15):
+    """调 dsh-web 里 feishu-session 插件的接口。
+
+    这是**唯一**能改 GUI 内存注册表的路：外部直接改 workspace.json 无效
+    （dsh-web 启动时读进内存，之后不看文件）。
+    """
+    url = f"http://127.0.0.1:{_dsh_web_port()}/feishu/new-session"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode("utf-8", "ignore")
+
+
+def all_session_ids():
+    """磁盘上所有 DSH 会话 ID（sessions/<项目目录>/<会话ID>）"""
+    out = set()
+    for path in glob.glob(os.path.join(DSH_SESSIONS, "*", "*")):
+        if os.path.isdir(path):
+            out.add(os.path.basename(path))
+    return sorted(out)
+
+
+def workspace_sets():
+    """返回 (已登记进 workspace 的会话集合, 已归档的会话集合)"""
+    ws = load_json(DSH_WORKSPACE, {}) or {}
+    registered, archived = set(), set()
+    for w in (ws.get("tables", {}).get("workspaces", {}) or {}).values():
+        registered.update(w.get("sessionIds") or [])
+    archived.update((ws.get("global", {}) or {}).get("archivedSessionIds") or [])
+    return registered, archived
+
+
+def session_is_bot_call(session_id, max_lines=60):
+    """会话文件里有没有飞书提示词指纹 —— 只看开头若干行，不全文解压"""
+    f = _session_file(_session_dir(session_id))
+    if not f:
+        return False
+    for i, line in enumerate(_zstd_lines(f)):
+        if i >= max_lines:
+            break
+        if BOT_PROMPT_MARKER in line:
+            return True
+        if any(m in line for m in BOT_PROMPT_LEGACY):
+            return True
+    return False
+
+
+def cmd_gui_hide(args):
+    """把 Bot 产生的散客会话归档（从 GUI 侧栏隐藏，文件保留）"""
+    if not os.path.isdir(DSH_SESSIONS):
+        die(f"找不到 DSH 会话目录: {DSH_SESSIONS}")
+    seen = (load_json(GUI_STATE_FILE, {}) or {}).get("seen", {}) or {}
+    registered, archived = workspace_sets()
+    todo = []
+    for sid in all_session_ids():
+        if sid in seen and not args.rescan:
+            continue
+        if sid in registered:
+            seen[sid] = "workspace"
+        elif sid in archived:
+            seen[sid] = "archived"
+        elif session_is_bot_call(sid):
+            todo.append(sid)
+        else:
+            seen[sid] = "kept"
+
+    if args.dry_run:
+        print(f"（试运行）会隐藏 {len(todo)} 个 Bot 会话，未登记散客共 "
+              f"{len([i for i in all_session_ids() if i not in registered and i not in archived])} 个")
+        for sid in todo:
+            print(f"  · {sid}")
+        return
+
+    if not todo:
+        save_json(GUI_STATE_FILE, {"seen": seen})
+        print("✅ 侧栏已经是干净的（没有需要隐藏的 Bot 会话）")
+        return
+
+    done, fails = [], []
+    for sid in todo:
+        try:
+            st, body = gui_plugin({"action": "archive", "sessionId": sid})
+        except Exception as e:
+            fails.append(f"{sid}: 连不上 dsh-web ({e})")
+            break
+        if st in (200, 202):
+            seen[sid] = "archived"
+            done.append(sid)
+        elif st == 409:
+            seen[sid] = "workspace"      # 已经属于某个 workspace，别动
+        else:
+            fails.append(f"{sid}: HTTP {st} {body[:80]}")
+
+    save_json(GUI_STATE_FILE, {"seen": seen})
+    print(f"✅ 已从 GUI 侧栏隐藏 {len(done)} 个 Bot 会话（归档，文件全部保留）")
+    if fails:
+        print(f"⚠️ {len(fails)} 个没处理成功：")
+        for x in fails[:5]:
+            print(f"  · {x}")
+
+
+def cmd_gui_restore(args):
+    """取消归档：把隐藏的会话放回 GUI 侧栏"""
+    registered, archived = workspace_sets()
+    targets = args.ids or sorted(archived)
+    if not targets:
+        print("没有需要恢复的会话")
+        return
+    done, fails = [], []
+    for sid in targets:
+        try:
+            st, body = gui_plugin({"action": "unarchive", "sessionId": sid})
+        except Exception as e:
+            fails.append(sid)
+            continue
+        if st == 200:
+            done.append(sid)
+        else:
+            fails.append(sid)
+
+    if done:
+        seen = (load_json(GUI_STATE_FILE, {}) or {}).get("seen", {}) or {}
+        for sid in done:
+            seen.pop(sid, None)
+        save_json(GUI_STATE_FILE, {"seen": seen})
+        print(f"✅ 已恢复 {len(done)} 个会话到 GUI 侧栏")
+
+    if fails:
+        # 兜底：插件是旧版（没有 unarchive 动作）时，直接改盘上状态。
+        # 代价是要重启 dsh-web 才会被读进内存。
+        ws = load_json(DSH_WORKSPACE, {}) or {}
+        g = ws.setdefault("global", {})
+        left = [x for x in (g.get("archivedSessionIds") or []) if x not in set(fails)]
+        g["archivedSessionIds"] = left
+        save_json(DSH_WORKSPACE, ws)
+        print(f"⚠️ {len(fails)} 个无法通过接口恢复，已直接改 storages/workspace.json")
+        print("   要生效需重启 dsh-web：sudo systemctl restart dsh-web")
+
+
+def cmd_gui_status(args):
+    """看看侧栏现状：哪些是项目、哪些是散客、藏了多少"""
+    registered, archived = workspace_sets()
+    ids = all_session_ids()
+    idset = set(ids)
+    # workspace.json 里可能残留"会话已被删掉、id 还挂着"的记录：
+    # 注册表运行期会把它们过滤掉（GUI 看不到），所以这里也按磁盘核对一遍。
+    ghosts = sorted(i for i in registered if i not in idset)
+    registered = {i for i in registered if i in idset}
+    stray = [i for i in ids if i not in registered and i not in archived]
+    bot = [i for i in stray if session_is_bot_call(i)]
+    other = [i for i in stray if i not in bot]
+    print(f"会话总数      : {len(ids)}")
+    print(f"已登记(项目)  : {len(registered)}")
+    print(f"已归档(隐藏)  : {len(archived)}")
+    print(f"散客(未分组)  : {len(stray)}  ← GUI 侧栏「未分组」显示的就是这些")
+    print(f"  ├ Bot 调用  : {len(bot)}（gui-hide 会隐藏它们）")
+    print(f"  └ 其他      : {len(other)}")
+    for i in other[:10]:
+        print(f"      · {i}")
+    if ghosts:
+        print(f"⚠️ 悬空登记    : {len(ghosts)} 个 —— 会话已经删了，workspace.json 里还挂着 id")
+        print( "                 注册表已过滤，GUI 看不到它；下次在工作区里新建会话/重命名会自动清掉")
+        for i in ghosts:
+            print(f"      · {i}")
+
+
+def cmd_archive_project(args):
+    """把一个飞书项目绑定的 DSH 会话在 GUI 里【归档】（只隐藏，不删文件）。
+
+    和 gui-hide 的区别：
+      - gui-hide 是"清理 Bot 自己的散客会话"，**绝不碰**已登记进 workspace 的项目会话；
+      - 这里是**用户显式发起**的（飞书里发「归档会话」→ 回数字），目标就是项目会话，
+        所以走插件的 force=true 绕过那道保护。
+    归档后：GUI 侧栏不显示、飞书侧也同步不显示（project_hidden 判定），
+    会话文件完整保留，`fbctl gui-restore <session_id>` 可恢复。
+    """
+    idx = load_index()
+    p = find_project(idx, args.key)
+    if not p:
+        die(f"找不到项目: {args.key}（先发「查看会话」看列表）")
+    if p.get("_default"):
+        die("「默认」是飞书自己的会话，没有对应的 GUI 会话，不能归档")
+    sid = (p.get("session_id") or "").strip()
+    if not sid:
+        die(f"项目「{p.get('title')}」没有绑定 DSH 会话，没法归档")
+    try:
+        st, body = gui_plugin({"action": "archive", "sessionId": sid, "force": True}, timeout=20)
+    except Exception as e:
+        die(f"连不上 dsh-web 插件({_dsh_web_port()}): {e}")
+    if st not in (200, 202):
+        die(f"归档失败 HTTP {st}: {body[:160]}")
+
+    switched = ""
+    if idx.get("current") == p.get("folder"):
+        idx["current"] = ""
+        save_index(idx)
+        switched = "\n· 它原来是当前项目，已切回「默认」"
+    print(f"✅ 已归档「{p.get('title')}」"
+          f"\n· GUI 侧栏不再显示（会话文件完整保留在磁盘上）"
+          f"\n· 飞书侧也同步不显示{switched}"
+          f"\n· 要恢复：fbctl gui-restore {sid}")
+
+
+# ---- 已归档会话的查看 / 恢复 ----
+
+def _is_bot_archived(sid):
+    """这个已归档会话是不是 Bot 自己 headless 调用产生的？
+
+    优先查 _gui_hygiene.json 的判定缓存（gui-hide 归档时写下的），
+    缓存里没有才去解压会话文件做指纹判定（慢，要起 zstdcat）。
+    """
+    st = (load_json(GUI_STATE_FILE, {}) or {}).get("seen", {}).get(sid)
+    if st == "archived":
+        return True
+    if st in ("workspace", "kept"):
+        return False
+    return session_is_bot_call(sid)
+
+
+def archived_entries():
+    """已归档会话列表（最近归档在前）。
+
+    默认【剔除 Bot 自己产生的 headless 会话】—— 那些是自动清理归档的噪音，
+    几十条同名记录挤在一起没法看。
+    """
+    ws = load_json(DSH_WORKSPACE, {}) or {}
+    arch = list((ws.get("global", {}) or {}).get("archivedSessionIds") or [])
+    out = []
+    for sid in reversed(arch):            # 最近归档的排前面
+        if _is_bot_archived(sid):
+            continue
+        title, _has = session_probe(sid)
+        out.append({"session_id": sid, "title": title or sid[:20]})
+    return out
+
+
+def _archived_noise_count():
+    """被省略掉的 Bot 会话条数"""
+    ws = load_json(DSH_WORKSPACE, {}) or {}
+    arch = list((ws.get("global", {}) or {}).get("archivedSessionIds") or [])
+    return sum(1 for sid in arch if _is_bot_archived(sid))
+
+
+def cmd_archived_list(args):
+    """列出已归档会话。--preview 只给标题（贴在「查看会话」后面用）。"""
+    entries = archived_entries()
+    noise = _archived_noise_count()
+    limit = getattr(args, "limit", 0) or 0
+    shown = entries[:limit] if limit > 0 else entries
+
+    if not shown:
+        if noise:
+            print(f"🗄 没有你手动归档的会话（另有 {noise} 个 Bot 调用产生的会话已归档）")
+        else:
+            print("🗄 没有已归档的会话")
+        return
+
+    if getattr(args, "preview", False):
+        # 顶格显示(用户要求):贴在「查看会话」最下面,不要缩进
+        print(f"🗄 已归档 {len(entries)} 个：")
+        for e in shown:
+            print(f"· {e['title']}")
+        if len(entries) > len(shown):
+            print(f"… 还有 {len(entries) - len(shown)} 个")
+        print("发「查看归档」看全部，并可回数字恢复。")
+        return
+
+    print(f"🗄 已归档的会话（共 {len(entries)} 个）")
+    for i, e in enumerate(shown, 1):
+        print(f"{i}. {e['title']}")
+        print(f"     session={e['session_id']}")
+    if noise:
+        print(f"   （另有 {noise} 个 Bot 调用产生的会话也已归档，这里省略了）")
+
+
+def cmd_archived_restore(args):
+    """按「查看归档」列表里的序号，把会话从归档里恢复出来"""
+    entries = archived_entries()
+    n = args.index
+    if not (1 <= n <= len(entries)):
+        die(f"序号超出范围：现在只有 {len(entries)} 个可恢复的已归档会话（发「查看归档」看列表）")
+    e = entries[n - 1]
+    try:
+        st, body = gui_plugin({"action": "unarchive", "sessionId": e["session_id"]}, timeout=20)
+    except Exception as ex:
+        die(f"连不上 dsh-web 插件({_dsh_web_port()}): {ex}")
+    if st != 200:
+        die(f"恢复失败 HTTP {st}: {body[:160]}")
+    print(f"✅ 已恢复「{e['title']}」"
+          f"\n· GUI 侧栏和飞书列表都会重新出现"
+          f"\n· session={e['session_id']}")
+
+
+# ============================================================
+# 入口
+# ============================================================
+
+def main():
+    ap = argparse.ArgumentParser(prog="fbctl", description="飞书 Bot 项目管理")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("list", help="列出项目")
+    p.add_argument("--all", action="store_true", help="连已归档的一起显示")
+    p.set_defaults(fn=cmd_list)
+    sub.add_parser("current", help="显示当前项目").set_defaults(fn=cmd_current)
+
+    p = sub.add_parser("switch", help="切换当前项目")
+    p.add_argument("key", help="序号/文件夹/标题")
+    p.set_defaults(fn=cmd_switch)
+
+    p = sub.add_parser("show", help="显示项目摘要")
+    p.add_argument("project", nargs="?", default="")
+    p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("log", help="记录用户说的一条")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("reply", help="记录助手回复的一条")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_reply)
+
+    p = sub.add_parser("context", help="组装提示词上下文")
+    p.add_argument("project", nargs="?", default="")
+    p.add_argument("--gui", type=int, default=10, help="GUI 侧取多少条(默认10;GUI 回复较长,不宜多)")
+    p.add_argument("--feishu", type=int, default=INJECT_LINES, help="飞书侧取多少条(默认30)")
+    p.set_defaults(fn=cmd_context)
+
+    p = sub.add_parser("gui", help="读 GUI 会话最近对话")
+    p.add_argument("project", nargs="?", default="")
+    p.add_argument("limit", nargs="?", type=int, default=30)
+    p.set_defaults(fn=cmd_gui)
+
+    p = sub.add_parser("summary", help="更新当前项目摘要")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_summary)
+
+    sub.add_parser("sync", help="从 DSH 同步项目列表").set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("new", help="新建项目(可绑定已有 GUI 会话)")
+    p.add_argument("name")
+    p.add_argument("--session", default="", help="要绑定的 GUI 会话 ID")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("bind", help="把一个已有 GUI 会话绑定成项目(兜底方案)")
+    p.add_argument("session_id")
+    p.add_argument("--title", default="", help="项目名(默认取会话标题)")
+    p.set_defaults(fn=cmd_bind)
+
+    p = sub.add_parser("remove", help="从列表移除项目(默认不删数据)")
+    p.add_argument("key", help="序号/文件夹/标题")
+    p.add_argument("--purge", action="store_true", help="连同记录目录一起删除")
+    p.set_defaults(fn=cmd_remove)
+
+    sub.add_parser("stats", help="存储统计").set_defaults(fn=cmd_stats)
+    sub.add_parser("maintain", help="滚动+归档").set_defaults(fn=cmd_maintain)
+
+    p = sub.add_parser("gui-hide", help="把 Bot 产生的 GUI 会话从侧栏隐藏(归档,不删文件)")
+    p.add_argument("--dry-run", action="store_true", help="只看看会隐藏哪些")
+    p.add_argument("--rescan", action="store_true", help="忽略缓存,重新判定所有会话")
+    p.set_defaults(fn=cmd_gui_hide)
+
+    p = sub.add_parser("gui-restore", help="取消隐藏,把会话放回侧栏")
+    p.add_argument("ids", nargs="*", help="会话 ID(默认恢复全部)")
+    p.set_defaults(fn=cmd_gui_restore)
+
+    sub.add_parser("gui-status", help="看侧栏现状").set_defaults(fn=cmd_gui_status)
+
+    p = sub.add_parser("archive-project", help="把某个项目会话在 GUI 里归档(用户显式操作)")
+    p.add_argument("key", help="序号/文件夹/标题")
+    p.set_defaults(fn=cmd_archive_project)
+
+    p = sub.add_parser("archived-list", help="列出已归档的会话")
+    p.add_argument("--limit", type=int, default=0, help="只列前 N 个")
+    p.add_argument("--preview", action="store_true", help="只给标题(贴在查看会话后面)")
+    p.set_defaults(fn=cmd_archived_list)
+
+    p = sub.add_parser("archived-restore", help="按序号把已归档会话恢复出来")
+    p.add_argument("index", type=int, help="「archived-list」里的序号")
+    p.set_defaults(fn=cmd_archived_restore)
+
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        sys.exit(0)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+# ══════════════════════════════════════════════════════════════
+# 挂进 DSH 的 web profile —— 让飞书 Bot 能在 GUI 里创建/归档会话
+#
+# 安装方式见 README 的「安装」一节，或直接跑：
+#     bash install.sh
+#
+# 这段内容要合并进：
+#     $DSH_HOME/profiles/web/cordis.patch.yml
+# （$DSH_HOME 默认是 <DSH 安装目录>/user_data）
+#
+# 把下面所有 <...> 占位符换成你自己的绝对路径。
+# ══════════════════════════════════════════════════════════════
+
+# 依赖：webhook 运行时（DSH 自带包，按名字引用）
+- insert:
+    - id: webhook
+      name: '@deepseek-ai/dsh-webhook'
+
+# 本体：本地单文件插件（零依赖）
+- insert:
+    - id: feishu-session
+      name: <仓库绝对路径>/dsh-plugin/feishu-session.mjs
+      config:
+        # 插件对外暴露的 HTTP 路径（fbctl 也按这个路径调它）
+        path: /feishu/new-session
+        # 在哪个工作区里创建会话。填 DSH GUI 里那个工作区的路径，通常是你的家目录
+        workspacePath: <你的家目录，如 /home/you>
+        agentPreset: standard
+        permissionPreset: workspace-write
+        # 删除会话用的 detach-session 动作：代码保留，但默认不加载。
+        # DSH 本身只有「归档」没有「删除会话」，真要启用改成 true。
+        enableDetach: false
+
+# ⚠️ 插件代码改动【不会热重载】（ESM 模块缓存），改完必须：
+#      sudo systemctl restart dsh-web
+# 归档接口要求插件 inject 里带 workspaceRegistry，少了它会直接 HTTP 500。
