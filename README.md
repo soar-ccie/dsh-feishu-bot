@@ -1,5 +1,7 @@
 # dsh-feishu-bot
 
+`MIT 协议` ｜ `Python 3.9+` ｜ `已在 DSH 0.1.5-rc.1 上验证`
+
 把 DSH (DeepSeek Harness) 接到飞书上，让你**在外面用手机就能接着聊家里那台机器上的项目**。
 
 > **主仓在 Gitee**：<https://gitee.com/soar_ccie/dsh-feishu-bot>
