@@ -1,6 +1,10 @@
 # dsh-feishu-bot
 
-把 [DSH (DeepSeek Harness)](https://github.com/deepseek-ai) 接到飞书上，让你**在外面用手机就能接着聊家里那台机器上的项目**。
+把 DSH (DeepSeek Harness) 接到飞书上，让你**在外面用手机就能接着聊家里那台机器上的项目**。
+
+> **主仓在 Gitee**：<https://gitee.com/soar_ccie/dsh-feishu-bot>
+> GitHub 是自动同步的**只读镜像**（<https://github.com/soar-ccie/dsh-feishu-bot>）。
+> **Issue / PR 请提到 Gitee** —— 镜像是覆盖式同步的，在 GitHub 上改的东西下次同步会被覆盖掉。
 
 不是"再开一个 AI 聊天窗口"，而是：**飞书 = 移动端入口，DSH Web GUI = 桌面端工作台，两边按项目对齐、互相读得到对方在说什么。**
 
@@ -100,8 +104,15 @@ Bot： 这张是编译报错的截图。结合你刚才说的"APK 打不出来"�
 
 ### 2. 装
 
+主仓在 **Gitee**，GitHub 是自动同步的镜像（国内用 Gitee 更快）：
+
 ```bash
-git clone <仓库地址> && cd dsh-feishu-bot
+# 主仓（推荐）
+git clone https://gitee.com/soar_ccie/dsh-feishu-bot.git && cd dsh-feishu-bot
+
+# 或镜像
+# git clone https://github.com/soar-ccie/dsh-feishu-bot.git && cd dsh-feishu-bot
+
 bash install.sh
 ```
 
