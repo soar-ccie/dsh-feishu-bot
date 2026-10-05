@@ -158,8 +158,8 @@ DSH 的归档语义：只往 `storages/workspace.json` 的 `global.archivedSessi
 
 ## 注意
 
-- 读 DSH 会话依赖其内部文件格式（当前 `session.v3.jsonl.zstd`）。
-  `fbctl` 已做了宽松解析 + 自动取最高版本；**将来 DSH 升级若格式变化，
+- 读 DSH 会话依赖其内部文件格式（`session.v?.jsonl.zstd`；0.1.5 是 v3，0.2.0 起是 v4）。
+  `fbctl` 已做了宽松解析 + **自动取最高版本**（不做版本白名单）；**将来 DSH 升级若格式变化，
   只需修改 `fbctl` 的 `read_gui_messages()` / `session_title()` 一处**。
 - 读不到时**降级**：用 `_index.json` 和 `guisession.json` 的缓存信息回答，
   不要报错卡住。

@@ -1,6 +1,6 @@
 # dsh-feishu-bot
 
-`MIT 协议` ｜ `Python 3.9+` ｜ `已在 DSH 0.1.5-rc.1 上验证`
+`MIT 协议` ｜ `Python 3.9+` ｜ `已在 DSH 0.1.5-rc.1 / 0.2.0-rc.2 上验证`
 
 把 DSH (DeepSeek Harness) 接到飞书上，让你**在外面用手机就能接着聊家里那台机器上的项目**。
 
@@ -94,7 +94,7 @@ Bot： 这张是编译报错的截图。结合你刚才说的"APK 打不出来"�
 
 ### 0. 前置
 
-- **DSH**：已安装并能跑 `dsh web`。本项目在 **DSH `0.1.5-rc.1`** 上开发验证。
+- **DSH**：已安装并能跑 `dsh web`。本项目在 **DSH `0.1.5-rc.1` 和 `0.2.0-rc.2`** 上都验证过（含 0.2.0 的新会话格式 `session.v4`）。
 - **Python 3.9+**（开发环境用的是 3.14）。
 - 一台**能被飞书连上**的机器 —— 用的是飞书**长连接**模式，**不需要公网 IP、不用备案域名、不用内网穿透**。
 
@@ -216,7 +216,8 @@ tail -f logs/feishu_bot.log
 
 | 限制 | 说明 |
 |---|---|
-| **DSH 版本敏感** | 插件用的是 DSH 内部接口（`ctx.webServer` / `ctx.webhookRuntime` / `ctx.workspaceRegistry`），`fbctl` 读的是 DSH 私有会话格式（`session.v3.jsonl.zstd`）。**DSH 升级后可能失效**，见 [docs/gui-ungrouped.md](docs/gui-ungrouped.md) |
+| **DSH 版本敏感** | 插件用的是 DSH 内部接口（`ctx.webServer` / `ctx.webhookRuntime` / `ctx.workspaceRegistry`），`fbctl` 读的是 DSH 私有会话格式（`session.v3.jsonl.zstd` / 0.2.0 起是 `session.v4.jsonl.zstd`）。**DSH 升级后可能失效**，见 [docs/gui-ungrouped.md](docs/gui-ungrouped.md) |
+| **已验证跨版本** | `0.1.5-rc.1 → 0.2.0-rc.2` 实测无需改代码：`fbctl` 自动取最高版本的会话文件，v3/v4 的 JSONL 结构一致。详见 [docs/dsh-0.2-compat.md](docs/dsh-0.2-compat.md) |
 | **两边不是同一个会话** | DSH 的会话独占写入（GUI 开着时别的进程拿不到写句柄），所以做不到"飞书和 GUI 共用一个会话"。这是运行时约束，配置绕不过去 —— 完整证据见 [docs/acp-investigation.md](docs/acp-investigation.md) |
 | **只归档，不删除** | DSH 本身没有"删除会话"的功能（GUI 里也只有"归档"）。本项目所有"清理"都只是归档：GUI 里不显示、文件完整保留，随时可恢复 |
 | **语音不转写** | 飞书音频消息的内容里**没有**识别文字（只有 `file_key` + `duration`）；官方 ASR 接口要付费版且只收 PCM。所以语音只落盘 + 回执 |

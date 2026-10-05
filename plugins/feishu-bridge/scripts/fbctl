@@ -893,7 +893,7 @@ def cmd_maintain(args):
 #
 # ⚠️ 归档 ≠ 删除：
 #   只是往 storages/workspace.json 的 archivedSessionIds 里记一笔，
-#   会话文件（session.v3.jsonl.zstd）原封不动留在磁盘上。
+#   会话文件（session.v?.jsonl.zstd）原封不动留在磁盘上。
 #   用户要求会话【永久保留】，所以这里永远只归档、绝不删除。
 #
 # 只归档"确实是 Bot 产生的"会话：用提示词首行做指纹，且已登记进

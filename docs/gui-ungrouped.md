@@ -75,7 +75,7 @@ archiveSession(sessionId) { ... }   // 落盘到 storages/workspace.json 的 glo
 
 **归档 ≠ 删除**：只往 `storages/workspace.json` 的
 `global.archivedSessionIds` 记一笔；会话目录
-（`sessions/<workspace>/<sessionId>/session.v3.jsonl.zstd`）原样保留。
+（`sessions/<workspace>/<sessionId>/session.v?.jsonl.zstd`）原样保留。
 用户要求"会话长久保持"，所以任何清理都只能是归档。
 
 ## 5. 为什么必须走 dsh-web 进程内的插件
@@ -127,7 +127,7 @@ Bot 每次处理完消息会自动跑一次 `gui-hide`，所以侧栏会一直�
 关掉自动隐藏：给 Bot 进程设 `FB_HIDE_HEADLESS=0`。
 
 **实测**：一批 Bot 会话归档后 `gui-status` 显示散客 0；
-被归档会话的目录与 `session.v3.jsonl.zstd` 全部还在磁盘上（一个没少）；
+被归档会话的目录与 `session.v?.jsonl.zstd` 全部还在磁盘上（一个没少）；
 `gui-restore <ID>` 能放回侧栏，再 `gui-hide` 又能藏回去。
 客户端**没有**「已归档」这样的分组或入口（`sessionVisible()` 直接把归档会话
 排除在所有视图之外），所以侧栏不会换成另一个已归档列表，就是干净地少了一块。
